@@ -1,4 +1,4 @@
-# QQ Agent Bot
+# Openclaw QQ Agent Bot
 
 一个模块化的 QQ 群 AI 助手框架，基于 **NapCat (OneBot v11)** + **OpenClaw Agent** 架构。
 
