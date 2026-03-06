@@ -483,7 +483,11 @@ function resolvePendingRequest(requestId, message) {
 // File-based reply polling (fallback for HTTP callback)
 function startReplyFilePoller(requestId) {
   // Check multiple reply directories
-  const replyDirs = [SHARED_REPLY_DIR];
+  const replyDirs = [
+    SHARED_REPLY_DIR,
+    '/home/openclaw/.openclaw/workspace-agent-lite/qq_replies',
+    '/home/openclaw/.openclaw/workspace-agent-strong/qq_replies',
+  ];
   const interval = setInterval(async () => {
     for (const dir of replyDirs) {
       try {
