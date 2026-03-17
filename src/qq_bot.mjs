@@ -281,10 +281,20 @@ function findIdleWorker() {
   return WORKERS.find(w => w.state === 'idle') || null;
 }
 
-function acquireWorker(worker, agentProfile, userId, requestId, question) {
+function acquireWorker(worker, agentProfile, userId, requestId, question, taskContext = {}) {
   worker.state = 'busy';
   worker.currentAgent = agentProfile;
-  worker.currentTask = { userId, requestId, startTime: Date.now(), question: question.slice(0, 60) };
+  worker.currentTask = {
+    userId,
+    requestId,
+    startTime: Date.now(),
+    question: question.slice(0, 60),
+    targetType: taskContext.targetType || '',
+    targetId: taskContext.targetId ? String(taskContext.targetId) : '',
+    lockKey: taskContext.lockKey || '',
+    groupKey: taskContext.groupKey || '',
+    chatId: taskContext.chatId || '',
+  };
   log('INFO', `[Worker] Acquired ${worker.id} -> Agent[${agentProfile.label}] for user=${userId} req=${requestId}`);
 }
 
@@ -318,6 +328,13 @@ function cancelWorkerPending(worker, reason = 'Interrupted') {
       }
     }
   }
+}
+
+function getWorkerSessionKey(worker) {
+  const task = worker?.currentTask;
+  const agentId = worker?.currentAgent?.agentId;
+  if (!task || !agentId || !task.targetType || !task.targetId) return '';
+  return getSessionKeyForChat(agentId, task.targetType, task.targetId);
 }
 
 function getWorkerByUser(userId) {
@@ -583,35 +600,84 @@ function resolvePendingRequest(requestId, message) {
   }
   return false;
 }
-// Reply file polling - fallback when Agent writes file but fails to call back
+// Reply file polling - fallback when Agent writes file but fails to call back.
+// Agent should write to a temporary file first, then atomically rename it to the
+// final reply file when the content is complete. We only consume the final file.
 const activePollers = new Map();
+const REPLY_FILE_POLL_INTERVAL_MS = 1000;
+const QQ_MESSAGE_SPLIT_TOKEN = '<<QQ_MSG_SPLIT>>';
+
+function splitAgentReplyMessages(text) {
+  const normalized = String(text ?? '').replace(/\r\n/g, '\n');
+  if (!normalized.includes(QQ_MESSAGE_SPLIT_TOKEN)) {
+    return [normalized];
+  }
+
+  return normalized.split(QQ_MESSAGE_SPLIT_TOKEN);
+}
+
+function sendAgentReply(targetType, targetId, text) {
+  const parts = splitAgentReplyMessages(text);
+  if (parts.length === 0) {
+    return 0;
+  }
+
+  for (const part of parts) {
+    if (part.length === 0) {
+      continue;
+    }
+    sendMsg(targetType, targetId, part);
+  }
+
+  if (parts.length > 1) {
+    log('INFO', `[AgentReply] Split reply into ${parts.length} QQ messages using explicit token`);
+  }
+  return parts.length;
+}
 
 function startReplyFilePoller(requestId) {
-  const POLL_INTERVAL = 1000;
-  const poller = setInterval(async () => {
-    for (const dir of ALL_REPLY_DIRS) {
-      try {
-        const rf = `${dir}/qq_reply_${requestId}.txt`;
-        const fs2 = await stat(rf).catch(() => null);
-        if (!fs2 || fs2.size === 0) continue;
-        const ct = await readFile(rf, "utf8");
-        const normalizedReply = normalizeAgentReply(ct);
-        if (normalizedReply.suppress && !ct.trim()) continue;
-        const ok = resolvePendingRequest(requestId, normalizedReply.text);
-        if (ok) log("INFO", `[FilePoll] Resolved requestId=${requestId} via reply file (${dir})`);
-        stopReplyFilePoller(requestId);
-        return;
-      } catch (err) { }
+  const state = {
+    interval: null,
+    busy: false,
+  };
+
+  const poll = async () => {
+    if (state.busy || !pendingRequests.has(requestId)) {
+      return;
     }
-  }, POLL_INTERVAL);
-  activePollers.set(requestId, poller);
+    state.busy = true;
+    try {
+      for (const dir of ALL_REPLY_DIRS) {
+        try {
+          const rf = `${dir}/qq_reply_${requestId}.txt`;
+          const fs2 = await stat(rf).catch(() => null);
+          if (!fs2 || fs2.size === 0) continue;
+
+          const ct = await readFile(rf, 'utf8');
+          const normalizedReply = normalizeAgentReply(ct);
+          if (normalizedReply.suppress && !ct.trim()) continue;
+
+          const ok = resolvePendingRequest(requestId, normalizedReply.text);
+          if (ok) log('INFO', `[FilePoll] Resolved requestId=${requestId} via final reply file (${dir}, size=${fs2.size})`);
+          return;
+        } catch (err) { }
+      }
+    } finally {
+      state.busy = false;
+    }
+  };
+
+  state.interval = setInterval(() => {
+    void poll();
+  }, REPLY_FILE_POLL_INTERVAL_MS);
+  activePollers.set(requestId, state);
 }
 function stopReplyFilePoller(requestId) {
-  const poller = activePollers.get(requestId);
-  if (poller) {
-    clearInterval(poller);
-    activePollers.delete(requestId);
+  const pollerState = activePollers.get(requestId);
+  if (pollerState?.interval) {
+    clearInterval(pollerState.interval);
   }
+  activePollers.delete(requestId);
 }
 
 // ============================================================
@@ -674,7 +740,7 @@ function startCallbackServer() {
             // Fallback: requestId not found (e.g. scheduled task / proactive message)
             // If targetType and targetId are provided, send directly
             if (!normalizedReply.suppress) {
-              sendMsg(targetType, String(targetId), normalizedReply.text);
+              sendAgentReply(targetType, String(targetId), normalizedReply.text);
               log('INFO', `[Callback] Fallback direct send (requestId=${requestId || 'none'}) → ${targetType}:${targetId}: ${normalizedReply.text.slice(0, 80)}`);
             } else {
               log('INFO', `[NoReply] Suppressed callback fallback for ${targetType}:${targetId}`);
@@ -1065,9 +1131,14 @@ async function askAgent(targetType, targetId, nickname, text, userId, worker = n
   const isOwner = OWNER_IDS.includes(String(userId));
   const replyDir = SHARED_REPLY_DIR;
   const replyFile = `qq_replies/qq_reply_${requestId}.txt`;
+  const tempReplyFile = `qq_replies/qq_reply_${requestId}.txt.tmp`;
   const identityReminder = getIdentityReminder();
-  const runtimeInstructions = `【回复方式】用 write 工具将回复内容写入文件 ${replyFile}。
-只需写入文件，系统会自动检测并发送给用户；不需要执行任何回调命令。`;
+  const runtimeInstructions = `【回复方式】先用 write 工具把完整回复写入临时文件 ${tempReplyFile}。
+写完后，再使用可用的文件操作工具把 ${tempReplyFile} 原子重命名为 ${replyFile}。
+只在完整内容准备好之后再重命名；不要把半截内容写进最终文件；不需要执行任何回调命令。
+默认整个文件内容会作为一条 QQ 消息发送。
+如果你希望分多条 QQ 消息发送，请在同一个文件中使用精确分隔符 <<QQ_MSG_SPLIT>> 分隔消息段。
+系统会按该分隔符拆分并逐条发送，分隔符本身不会发给用户。`;
   const agentMessage = `${identityReminder}
 ${runtimeInstructions}
 ${recentContext}【QQ群消息】
@@ -1088,6 +1159,7 @@ requestId: ${requestId}`;
   // Send RPC to Agent using correct Gateway protocol frame format
   const rpcId = randomUUID();
   activeAgentRequests.set(requestId, { rpcId });
+  const pendingReply = registerPendingRequest(requestId, targetType, targetId);
   try {
     await gatewaySendWithId(rpcId, 'agent', {
       message: agentMessage,
@@ -1098,6 +1170,13 @@ requestId: ${requestId}`;
     log('INFO', `[Agent]${workerLabel} Dispatched requestId=${requestId}: ${text.slice(0, 60)}`);
     if (worker && worker.currentTask) worker.currentTask.requestId = requestId;
   } catch (err) {
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingRequests.delete(requestId);
+      stopReplyFilePoller(requestId);
+      pending.reject(new Error(`Agent dispatch failed: ${err.message}`));
+    }
     activeAgentRequests.delete(requestId);
     log('ERROR', `[Agent] RPC failed: ${err.message}`);
     throw new Error(`Agent dispatch failed: ${err.message}`);
@@ -1105,7 +1184,7 @@ requestId: ${requestId}`;
 
   // Wait for Agent to call back via HTTP (or fast error rejection)
   try {
-    const reply = await registerPendingRequest(requestId, targetType, targetId);
+    const reply = await pendingReply;
     return normalizeAgentReply(reply);
   } finally {
     activeAgentRequests.delete(requestId);
@@ -1253,9 +1332,10 @@ async function handleEvent(raw) {
       return;
     }
     const stopTaskId = w.currentTask?.requestId;
+    const stopTask = w.currentTask ? { ...w.currentTask } : null;
     log('INFO', `[Stop] User ${userId} stopping worker ${w.id}, task=${stopTaskId}`);
     try {
-      await gatewaySend('sessions.reset', { key: w.currentAgent ? getSessionKeyForChat(w.currentAgent.agentId, targetType, targetId) : "" });
+      await gatewaySend('sessions.reset', { key: getWorkerSessionKey(w) });
       log('INFO', `[Stop] Session reset for worker ${w.id}`);
     } catch (e) {
       log('WARN', `[Stop] sessions.reset failed for ${w.id}: ${e.message}`);
@@ -1268,9 +1348,10 @@ async function handleEvent(raw) {
     }
     cancelWorkerPending(w, 'Interrupted by /stop');
     releaseWorker(w);
-    const stopLockKey = `${targetType}:${targetId}:${userId}`;
-    userLocks.delete(stopLockKey);
-    decrementGroupPending(`${targetType}:${targetId}`);
+    if (stopTask?.lockKey) userLocks.delete(stopTask.lockKey);
+    else userLocks.delete(`${targetType}:${targetId}:${userId}`);
+    if (stopTask?.groupKey) decrementGroupPending(stopTask.groupKey);
+    else decrementGroupPending(`${targetType}:${targetId}`);
     sendMsg(targetType, targetId, `✅ 已中断 ${w.id} Worker 的任务。`);
     return;
   }
@@ -1283,13 +1364,16 @@ async function handleEvent(raw) {
     if (!w) { sendMsg(targetType, targetId, `Worker "${targetWorkerId}" 不存在。可用: ${WORKERS.map(w => w.id).join(', ')}`); return; }
     if (w.state !== 'busy') { sendMsg(targetType, targetId, `Worker ${w.id} 当前是空闲的。`); return; }
     log('INFO', `[Stop] Owner force-stopping worker ${w.id}`);
+    const forceTask = w.currentTask ? { ...w.currentTask } : null;
     try {
-      await gatewaySend('sessions.reset', { key: w.currentAgent ? getSessionKeyForChat(w.currentAgent.agentId, targetType, targetId) : "" });
+      await gatewaySend('sessions.reset', { key: getWorkerSessionKey(w) });
     } catch (e) {
       log('WARN', `[Stop] sessions.reset failed: ${e.message}`);
     }
     cancelWorkerPending(w, 'Force interrupted by owner');
     releaseWorker(w);
+    if (forceTask?.lockKey) userLocks.delete(forceTask.lockKey);
+    if (forceTask?.groupKey) decrementGroupPending(forceTask.groupKey);
     sendMsg(targetType, targetId, `✅ 已强制中断 ${w.id} Worker。`);
     return;
   }
@@ -1487,9 +1571,18 @@ async function handleEvent(raw) {
         const PF_TIMEOUT = 30000;
         const pf0 = Date.now();
         try {
+          const pfRequestId = `bench-pf-${k}-${Date.now()}`;
           const pfP = new Promise((res, rej) => {
             const t = setTimeout(() => { cl(); rej(new Error("preflight timeout 30s")); }, PF_TIMEOUT);
-            const h = (ev) => { if (ev === "chat") { clearTimeout(t); cl(); res("ok"); } };
+            const h = (ev) => {
+              if (!ev || ev.event !== 'chat') return;
+              const payload = ev.payload || {};
+              const matchedId = payload.idempotencyKey || payload.runId || payload.message?.runId || '';
+              if (matchedId !== pfRequestId) return;
+              clearTimeout(t);
+              cl();
+              res("ok");
+            };
             if (!global._benchPfHandlers) global._benchPfHandlers = [];
             global._benchPfHandlers.push(h);
             const cl = () => { const i = (global._benchPfHandlers || []).indexOf(h); if (i >= 0) global._benchPfHandlers.splice(i, 1); };
@@ -1497,7 +1590,7 @@ async function handleEvent(raw) {
           await gatewaySend("agent", {
             message: "请回复收到",
             sessionKey: OPENCLAW_SESSION_KEY,
-            idempotencyKey: `bench-pf-${k}-${Date.now()}`,
+            idempotencyKey: pfRequestId,
           });
           await pfP;
           const pfDt = ((Date.now() - pf0) / 1000).toFixed(1);
@@ -1647,8 +1740,10 @@ async function handleEvent(raw) {
         });
 
         const dt = ((Date.now() - t0) / 1000).toFixed(1);
-        results.push({ k, name: v.n, time: dt, status: 'OK', len: reply.length, reply: reply.slice(0, 100) });
-        sendMsg(targetType, targetId, `#${k} ${v.n}: ${dt}s OK (${reply.length}字)`);
+        const replyText = typeof reply === 'string' ? reply : (reply?.text || '');
+        const replyLen = replyText.length;
+        results.push({ k, name: v.n, time: dt, status: 'OK', len: replyLen, reply: replyText.slice(0, 100) });
+        sendMsg(targetType, targetId, `#${k} ${v.n}: ${dt}s OK (${replyLen}字)`);
       } catch (e) {
         const dt = ((Date.now() - t0) / 1000).toFixed(1);
         results.push({ k, name: v.n, time: dt, status: e.message.slice(0, 60) });
@@ -1691,9 +1786,10 @@ async function handleEvent(raw) {
     const oldWorker = getWorkerByUser(String(userId));
     if (oldWorker) {
       const autoStopTaskId = oldWorker.currentTask?.requestId;
+      const oldTask = oldWorker.currentTask ? { ...oldWorker.currentTask } : null;
       log('INFO', `[AutoStop] User ${userId} sent new msg, interrupting worker ${oldWorker.id} task=${autoStopTaskId}`);
       try {
-        await gatewaySend('sessions.reset', { key: oldWorker.currentAgent ? getSessionKeyForChat(oldWorker.currentAgent.agentId, targetType, targetId) : "" });
+        await gatewaySend('sessions.reset', { key: getWorkerSessionKey(oldWorker) });
       } catch (e) {
         log('WARN', `[AutoStop] sessions.reset failed: ${e.message}`);
       }
@@ -1703,6 +1799,8 @@ async function handleEvent(raw) {
       } else {
         cancelWorkerPending(oldWorker, 'Interrupted by new message');
         releaseWorker(oldWorker);
+        if (oldTask?.lockKey) userLocks.delete(oldTask.lockKey);
+        if (oldTask?.groupKey) decrementGroupPending(oldTask.groupKey);
         sendMsg(targetType, targetId, '⏹️ 已中断上一个任务，正在处理新消息...');
       }
     }
@@ -1779,7 +1877,7 @@ async function handleEvent(raw) {
       sendMsg(targetType, targetId, '正在思考中，请稍候...');
       try {
         const r = await askAgent(targetType, targetId, nickname, text, userId);
-        if (!r.suppress) sendMsg(targetType, targetId, r.text);
+        if (!r.suppress) sendAgentReply(targetType, targetId, r.text);
         else log('INFO', `[NoReply] Agent fallback returned NO_REPLY, suppressing output for ${nickname}(${userId})`);
       }
       catch (e2) { sendMsg(targetType, targetId, '抱歉，AI暂时无法响应。'); }
@@ -1794,7 +1892,13 @@ async function handleEvent(raw) {
     sendMsg(targetType, targetId, '⏳ 所有 AI 助手都在忙，请稍后再试～');
     userLocks.delete(lockKey); decrementGroupPending(groupKey); return;
   }
-  acquireWorker(worker, agentProfile, String(userId), `req-${Date.now()}`, text);
+  acquireWorker(worker, agentProfile, String(userId), `req-${Date.now()}`, text, {
+    targetType,
+    targetId,
+    lockKey,
+    groupKey,
+    chatId,
+  });
   sendMsg(targetType, targetId, `正在思考中(${worker.id}->${agentProfile.label})，请稍候...`);
   const progressTimers = [];
   progressTimers.push(setTimeout(() => {
@@ -1809,7 +1913,7 @@ async function handleEvent(raw) {
   try {
     const reply = await askAgent(targetType, targetId, nickname, text, userId, worker);
     if (!reply.suppress) {
-      sendMsg(targetType, targetId, reply.text);
+      sendAgentReply(targetType, targetId, reply.text);
       const _dur = worker.currentTask ? Date.now() - worker.currentTask.startTime : 0;
       recordInteraction(text, reply.text, targetType, targetId, nickname, agentProfile.label, _dur).catch(() => { });
     } else {
